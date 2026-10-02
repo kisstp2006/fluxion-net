@@ -46,6 +46,19 @@ A body saved to a file is written as `<path>.part` and renamed when it is whole;
 
 `Options.max_running` (4) is how many requests are on their way at once; the rest wait their turn, in the order they were sent. With no thread to give it, a request runs where it is sent.
 
+## In a browser
+
+Built for `wasm32-wasi`, a request is the page's own `fetch`, and the same calls ask and collect. `src/fluxion-net.js` is the page's half - a dependant takes it from the build as `dep.namedLazyPath("fluxion-net.js")` and installs it beside its module - and it is one more glue for the platform's:
+
+```js
+import { Platform } from "./fluxion-platform.js";
+import { Net } from "./fluxion-net.js";
+
+await new Platform({ canvas }).run("./game.wasm", { with: [new Net()] });
+```
+
+The page's rules hold there. Another site answers only if it allows this page to ask it (CORS), and a refusal looks to the page like a host that cannot be reached: `Connect`, with the browser's own word in its console. The browser sends its own user agent. A request with a body follows no redirect, as anywhere, but one is a failure (`Broken`) rather than an answer. A file saved to is written whole once the answer is, into the program's own files.
+
 ## Tests
 
 `zig build test` runs the client against a server on this machine: answers, statuses, redirects, a URL kept as it was written, a body and its type, plain HTTP refused, what takes too long, what is too large, what is cancelled before it starts, and a file saved whole.

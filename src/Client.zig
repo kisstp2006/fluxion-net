@@ -21,18 +21,27 @@
 //! A URL goes out as it is written: its path and query are not encoded
 //! again, so a request signed over its URL arrives with the URL it was
 //! signed over.
+//!
+//! In a browser a request is the page's own `fetch`, which
+//! `fluxion-net.js` runs, and the same calls ask and collect: the page's
+//! rules hold there - another site answers only if it allows this page to
+//! ask it, and the browser sends its own user agent.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const http = std.http;
 
 const Client = @This();
 
+const is_web = builtin.cpu.arch.isWasm();
+
 gpa: Allocator,
 io: Io,
 options: Options,
-http_client: http.Client,
+/// Nothing in a browser, where the page asks.
+http_client: if (is_web) void else http.Client,
 /// Every request not yet collected, in the order it was sent: those that
 /// wait start in this order.
 jobs: std.ArrayList(*Job) = .empty,
@@ -148,7 +157,11 @@ pub const Progress = struct {
     total: ?u64,
 };
 
-const unknown_total = std.math.maxInt(u64);
+/// What a body's bytes are counted in: a word in a browser, which has no
+/// wider atomics (and no other thread to read them).
+const Count = if (is_web) usize else u64;
+
+const unknown_total = std.math.maxInt(Count);
 
 const Job = struct {
     id: Id,
@@ -156,13 +169,15 @@ const Job = struct {
     arena: std.heap.ArenaAllocator,
     request: Request = undefined,
     state: std.atomic.Value(State) = .init(.waiting),
-    received: std.atomic.Value(u64) = .init(0),
-    total: std.atomic.Value(u64) = .init(unknown_total),
+    received: std.atomic.Value(Count) = .init(0),
+    total: std.atomic.Value(Count) = .init(unknown_total),
     /// Set before it is cancelled, so that whatever failed as it was
     /// stopped is said to be the cancelling.
     stopping: std.atomic.Value(bool) = .init(false),
     timed_out: bool = false,
     future: Io.Future(void) = .{ .any_future = null, .result = {} },
+    /// The page's number for it, in a browser.
+    fetch: u32 = 0,
     started_at: Io.Timestamp = .zero,
     result: Error!Response = error.Cancelled,
     reason: []const u8 = "",
@@ -191,21 +206,18 @@ const Job = struct {
 };
 
 pub fn init(gpa: Allocator, io: Io, options: Options) Client {
-    return .{ .gpa = gpa, .io = io, .options = options, .http_client = .{ .allocator = gpa, .io = io } };
+    return .{ .gpa = gpa, .io = io, .options = options, .http_client = if (is_web) {} else .{ .allocator = gpa, .io = io } };
 }
 
 /// Stops every request still on its way, and drops every answer not yet
 /// collected.
 pub fn deinit(c: *Client) void {
     for (c.jobs.items) |job| {
-        if (job.state.load(.acquire) == .running) {
-            job.stopping.store(true, .release);
-            _ = job.future.cancel(c.io);
-        }
+        if (job.state.load(.acquire) == .running) c.stop(job);
         c.drop(job);
     }
     c.jobs.deinit(c.gpa);
-    c.http_client.deinit();
+    if (!is_web) c.http_client.deinit();
     c.* = undefined;
 }
 
@@ -235,8 +247,9 @@ pub fn send(c: *Client, request: Request) Allocator.Error!Id {
 }
 
 /// Ends a request: one waiting its turn never starts, one on its way stops
-/// where it is (this waits for that, a moment). Its `Done` says
-/// `Cancelled`; one already done keeps its answer.
+/// where it is (this waits for that, a moment; in a browser its `Done`
+/// comes a frame or so later). Its `Done` says `Cancelled`; one already
+/// done keeps its answer.
 pub fn cancel(c: *Client, id: Id) void {
     const job = c.find(id) orelse return;
     switch (job.state.load(.acquire)) {
@@ -244,12 +257,15 @@ pub fn cancel(c: *Client, id: Id) void {
             job.result = job.failed(error.Cancelled, "cancelled");
             job.state.store(.done, .release);
         },
-        .running => {
-            job.stopping.store(true, .release);
-            _ = job.future.cancel(c.io);
-        },
+        .running => c.stop(job),
         .done => {},
     }
+}
+
+/// Stops one on its way: whatever it fails with is said to be the stopping.
+fn stop(c: *Client, job: *Job) void {
+    job.stopping.store(true, .release);
+    if (is_web) web.glue.cancel(job.fetch) else _ = job.future.cancel(c.io);
 }
 
 /// How far a request not yet collected has come; null for one there is
@@ -273,14 +289,16 @@ pub fn pending(c: *const Client) usize {
 /// in `into`, in the order they were sent, each the caller's to `deinit` -
 /// and starts what waits. Once a frame.
 pub fn update(c: *Client, into: []Done) []Done {
+    if (is_web) for (c.jobs.items) |job| {
+        if (job.state.load(.acquire) == .running) web.poll(c, job);
+    };
     const now = Io.Clock.awake.now(c.io);
     for (c.jobs.items) |job| {
         if (job.state.load(.acquire) != .running or job.request.timeout_ms == 0) continue;
         const ran = job.started_at.durationTo(now).nanoseconds;
         if (ran < @as(i96, job.request.timeout_ms) * std.time.ns_per_ms) continue;
         job.timed_out = true;
-        job.stopping.store(true, .release);
-        _ = job.future.cancel(c.io);
+        c.stop(job);
     }
     var n: usize = 0;
     var i: usize = 0;
@@ -290,7 +308,7 @@ pub fn update(c: *Client, into: []Done) []Done {
             i += 1;
             continue;
         }
-        job.future.await(c.io);
+        if (!is_web) job.future.await(c.io);
         var result = job.result;
         if (job.timed_out) {
             if (result) |_| {} else |_| {
@@ -315,6 +333,7 @@ fn find(c: *const Client, id: Id) ?*Job {
 }
 
 fn drop(c: *Client, job: *Job) void {
+    if (is_web and job.fetch != 0) web.glue.release(job.fetch);
     if (job.result) |*r| r.deinit() else |_| {}
     job.arena.deinit();
     c.gpa.destroy(job);
@@ -330,6 +349,11 @@ fn startWaiting(c: *Client) void {
         if (job.state.load(.acquire) != .waiting) continue;
         job.state.store(.running, .release);
         job.started_at = Io.Clock.awake.now(c.io);
+        if (is_web) {
+            web.start(c, job);
+            running += 1;
+            continue;
+        }
         job.future = c.io.concurrent(run, .{ c, job }) catch {
             // Nowhere else to run it: it runs here, now.
             run(c, job);
@@ -344,13 +368,19 @@ fn run(c: *Client, job: *Job) void {
     job.state.store(.done, .release);
 }
 
+/// Whether `url` may be asked at all: an http or https one, and plain http
+/// only if the client allows it.
+fn checkUrl(c: *const Client, job: *Job, url: []const u8) Error!void {
+    const uri = std.Uri.parse(url) catch return job.failed(error.BadUrl, "the URL does not parse");
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) return;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return job.failed(error.BadUrl, "only http and https URLs are asked");
+    if (!c.options.allow_plain_http) return job.failed(error.NotSecure, "plain http is not allowed: ask over https");
+}
+
 fn perform(c: *Client, job: *Job) Error!Response {
     const r = &job.request;
-    const uri = std.Uri.parse(r.url) catch return job.failed(error.BadUrl, "the URL does not parse");
-    if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
-        if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return job.failed(error.BadUrl, "only http and https URLs are asked");
-        if (!c.options.allow_plain_http) return job.failed(error.NotSecure, "plain http is not allowed: ask over https");
-    }
+    try c.checkUrl(job, r.url);
+    const uri = std.Uri.parse(r.url) catch unreachable;
 
     const has_body = r.body.len > 0 or r.method.requestHasBody();
     var req = c.http_client.request(r.method, uri, .{
@@ -452,3 +482,108 @@ fn save(c: *Client, job: *Job, reader: *Io.Reader, response: *http.Client.Respon
     };
     return n;
 }
+
+/// A request as the page's `fetch`: `fluxion-net.js` is the other side. It
+/// runs as the page's own; `update` asks how it is doing and, once it has
+/// an answer, copies it out.
+const web = struct {
+    const glue = struct {
+        /// Its headers are `name: value` lines; `follow` follows redirects,
+        /// else one is a failure.
+        extern "fluxion_net" fn start(method: [*]const u8, method_len: usize, url: [*]const u8, url_len: usize, headers: [*]const u8, headers_len: usize, body: [*]const u8, body_len: usize, follow: bool) u32;
+        extern "fluxion_net" fn state(fetch: u32) State;
+        extern "fluxion_net" fn received(fetch: u32) f64;
+        /// -1 while the answer has not said.
+        extern "fluxion_net" fn total(fetch: u32) f64;
+        extern "fluxion_net" fn status(fetch: u32) u32;
+        extern "fluxion_net" fn headersLength(fetch: u32) usize;
+        extern "fluxion_net" fn bodyLength(fetch: u32) usize;
+        /// Its headers, as `name: value` lines, and its body.
+        extern "fluxion_net" fn copy(fetch: u32, headers: [*]u8, body: [*]u8) void;
+        extern "fluxion_net" fn cancel(fetch: u32) void;
+        /// Forgets it, stopping it if it is still on its way.
+        extern "fluxion_net" fn release(fetch: u32) void;
+    };
+
+    const State = enum(u32) { running, answered, bad_url, connect, cancelled, broken, _ };
+
+    fn start(c: *Client, job: *Job) void {
+        const r = &job.request;
+        c.checkUrl(job, r.url) catch |err| return finished(job, err);
+        const has_body = r.body.len > 0 or r.method.requestHasBody();
+        var headers: std.ArrayList(u8) = .empty;
+        const a = job.arena.allocator();
+        for (r.headers) |h| headers.print(a, "{s}: {s}\n", .{ h.name, h.value }) catch return finished(job, error.OutOfMemory);
+        if (has_body) headers.print(a, "content-type: {s}\n", .{r.content_type orelse "application/octet-stream"}) catch return finished(job, error.OutOfMemory);
+        const method = @tagName(r.method);
+        job.fetch = glue.start(method.ptr, method.len, r.url.ptr, r.url.len, headers.items.ptr, headers.items.len, r.body.ptr, r.body.len, !has_body and r.redirects > 0);
+    }
+
+    fn poll(c: *Client, job: *Job) void {
+        switch (glue.state(job.fetch)) {
+            .running => {
+                job.received.store(@intFromFloat(glue.received(job.fetch)), .release);
+                const total = glue.total(job.fetch);
+                if (total >= 0) job.total.store(@intFromFloat(total), .release);
+            },
+            .answered => finished(job, answer(c, job)),
+            .bad_url => finished(job, job.failed(error.BadUrl, "the browser did not take the URL")),
+            .connect => finished(job, job.failed(error.Connect, "the host could not be reached, or did not allow this page to ask it")),
+            .cancelled => finished(job, job.failed(error.Cancelled, "cancelled")),
+            else => finished(job, job.failed(error.Broken, "the answer broke off")),
+        }
+    }
+
+    fn finished(job: *Job, result: Error!Response) void {
+        job.result = if (job.stopping.load(.acquire)) blk: {
+            if (result) |r| {
+                var answered = r;
+                answered.deinit();
+            } else |_| {}
+            break :blk job.failed(error.Cancelled, "cancelled");
+        } else result;
+        job.state.store(.done, .release);
+    }
+
+    fn answer(c: *Client, job: *Job) Error!Response {
+        const r = &job.request;
+        var out: Response = .{ .status = @intCast(glue.status(job.fetch)), .arena = .init(c.gpa) };
+        errdefer out.arena.deinit();
+        const a = out.arena.allocator();
+
+        // Only a success goes to a file, as on any other system.
+        const saving = r.save_to != null and out.status >= 200 and out.status < 300;
+        const size = glue.bodyLength(job.fetch);
+        if (!saving and size > r.max_body) return job.failed(error.TooLarge, "the body is longer than the request allows");
+        const head = try a.alloc(u8, glue.headersLength(job.fetch));
+        const body = try (if (saving) c.gpa else a).alloc(u8, size);
+        defer if (saving) c.gpa.free(body);
+        glue.copy(job.fetch, head.ptr, body.ptr);
+
+        var headers: std.ArrayList(Header) = .empty;
+        var lines = std.mem.tokenizeScalar(u8, head, '\n');
+        while (lines.next()) |line| {
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            try headers.append(a, .{ .name = line[0..colon], .value = std.mem.trim(u8, line[colon + 1 ..], " ") });
+        }
+        out.headers = headers.items;
+        out.size = size;
+        job.received.store(size, .release);
+        if (saving) try saveWhole(c, job, body, r.save_to.?) else out.body = body;
+        return out;
+    }
+
+    /// Written as `<path>.part` and renamed, as a body streamed to a file is.
+    fn saveWhole(c: *Client, job: *Job, bytes: []const u8, path: []const u8) Error!void {
+        const dir = Io.Dir.cwd();
+        if (std.fs.path.dirname(path)) |parent| {
+            dir.createDirPath(c.io, parent) catch |err| return job.failed(error.CannotSave, @errorName(err));
+        }
+        const part = try std.fmt.allocPrint(job.arena.allocator(), "{s}.part", .{path});
+        dir.writeFile(c.io, .{ .sub_path = part, .data = bytes }) catch |err| return job.failed(error.CannotSave, @errorName(err));
+        Io.Dir.rename(dir, part, dir, path, c.io) catch |err| {
+            dir.deleteFile(c.io, part) catch {};
+            return job.failed(error.CannotSave, @errorName(err));
+        };
+    }
+};
