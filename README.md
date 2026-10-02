@@ -57,7 +57,7 @@ import { Net } from "./fluxion-net.js";
 await new Platform({ canvas }).run("./game.wasm", { with: [new Net()] });
 ```
 
-The page's rules hold there. Another site answers only if it allows this page to ask it (CORS), and a refusal looks to the page like a host that cannot be reached: `Connect`, with the browser's own word in its console. The browser sends its own user agent. A request with a body follows no redirect, as anywhere, but one is a failure (`Broken`) rather than an answer. A file saved to is written whole once the answer is, into the program's own files.
+The page's rules hold there. Another site answers only if it allows this page to ask it (CORS), and a refusal looks to the page like a host that cannot be reached: `Connect`, with the browser's own word in its console. The browser sends its own user agent. A request with a body follows no redirect, as anywhere, but the browser makes one a failure (`Connect`) rather than an answer. A file saved to is written whole once the answer is, into the program's own files.
 
 ## Tests
 
