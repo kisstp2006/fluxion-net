@@ -498,8 +498,9 @@ const web = struct {
         extern "fluxion_net" fn status(fetch: u32) u32;
         extern "fluxion_net" fn headersLength(fetch: u32) usize;
         extern "fluxion_net" fn bodyLength(fetch: u32) usize;
-        /// Its headers, as `name: value` lines, and its body.
-        extern "fluxion_net" fn copy(fetch: u32, headers: [*]u8, body: [*]u8) void;
+        /// Its headers, as `name: value` lines, and its body. False when
+        /// the page could not put them there, which breaks the request.
+        extern "fluxion_net" fn copy(fetch: u32, headers: [*]u8, body: [*]u8) bool;
         extern "fluxion_net" fn cancel(fetch: u32) void;
         /// Forgets it, stopping it if it is still on its way.
         extern "fluxion_net" fn release(fetch: u32) void;
@@ -558,7 +559,7 @@ const web = struct {
         const head = try a.alloc(u8, glue.headersLength(job.fetch));
         const body = try (if (saving) c.gpa else a).alloc(u8, size);
         defer if (saving) c.gpa.free(body);
-        glue.copy(job.fetch, head.ptr, body.ptr);
+        if (!glue.copy(job.fetch, head.ptr, body.ptr)) return job.failed(error.Broken, "the answer could not be copied in");
 
         var headers: std.ArrayList(Header) = .empty;
         var lines = std.mem.tokenizeScalar(u8, head, '\n');

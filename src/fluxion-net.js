@@ -29,9 +29,10 @@ export class Net {
   }
 
   /// The module's bytes from `ptr`, read at once: its memory may grow and
-  /// move them by the next call.
+  /// move them by the next call. A wasm32 address comes as a signed number,
+  /// negative past 2 GB, so it is read as the unsigned one it is.
   bytes(ptr, len) {
-    return new Uint8Array(this.memory.buffer, ptr, len);
+    return new Uint8Array(this.memory.buffer, ptr >>> 0, len >>> 0);
   }
 
   text(ptr, len) {
@@ -57,11 +58,22 @@ export class Net {
         status: (id) => at(id)?.status ?? 0,
         headersLength: (id) => at(id)?.head.length ?? 0,
         bodyLength: (id) => at(id)?.body?.length ?? 0,
+        // Says whether the answer went where it was asked to. A place that
+        // is not in the module's memory breaks this request and no more: a
+        // throw here would come out of the frame that asked, and end the
+        // game.
         copy: (id, headers, body) => {
           const fetched = at(id);
-          if (!fetched) return;
-          if (fetched.head.length > 0) this.bytes(headers, fetched.head.length).set(fetched.head);
-          if (fetched.body?.length > 0) this.bytes(body, fetched.body.length).set(fetched.body);
+          if (!fetched) return 0;
+          try {
+            if (fetched.head.length > 0) this.bytes(headers, fetched.head.length).set(fetched.head);
+            if (fetched.body?.length > 0) this.bytes(body, fetched.body.length).set(fetched.body);
+            return 1;
+          } catch (error) {
+            console.warn(`fluxion-net: an answer could not be copied: ${error.message}`);
+            fetched.state = STATE.broken;
+            return 0;
+          }
         },
         cancel: (id) => at(id)?.controller.abort(),
         release: (id) => {
